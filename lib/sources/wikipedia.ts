@@ -1,13 +1,14 @@
 // lib/sources/wikipedia.ts
-// Addition: referenced in the requested fallback chain ("Semua down →
-// Wikipedia") but no endpoint/UA was specified, and the current Wikipedia-only
-// implementation wasn't shared in this conversation — so this is a new,
-// minimal wrapper around Wikipedia's official search API. No scraping, no
-// auth needed, which is exactly why it's a solid last resort.
+// CHANGE: switched from en.wikipedia.org to id.wikipedia.org — the reported
+// results ("Jaringan saraf tiruan", "Pembelajaran terbimbing", etc.) are
+// clearly from Indonesian Wikipedia, so that's what the live app actually
+// needs. MAX_RESULTS also raised 5 → 10: when this fallback fires, Wikipedia
+// is the *only* source in the pool, and needs enough raw candidates to still
+// have up to 7 survive the relevance filter in lib/relevance.ts.
 import { MultiSourceResult } from "./types";
 
 const TIMEOUT_MS = 6000;
-const MAX_RESULTS = 5;
+const MAX_RESULTS = 10;
 
 interface WikipediaSearchResponse {
   query?: {
@@ -19,7 +20,7 @@ interface WikipediaSearchResponse {
 }
 
 export async function searchWikipedia(query: string): Promise<MultiSourceResult[]> {
-  const requestUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=${MAX_RESULTS}&srsearch=${encodeURIComponent(query)}`;
+  const requestUrl = `https://id.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=${MAX_RESULTS}&srsearch=${encodeURIComponent(query)}`;
 
   const response = await fetch(requestUrl, {
     signal: AbortSignal.timeout(TIMEOUT_MS),
@@ -35,7 +36,7 @@ export async function searchWikipedia(query: string): Promise<MultiSourceResult[
   return items.map((item) => ({
     title: item.title,
     snippet: item.snippet.replace(/<[^>]+>/g, ""),
-    url: `https://en.wikipedia.org/wiki/${encodeURIComponent(item.title.replace(/ /g, "_"))}`,
+    url: `https://id.wikipedia.org/wiki/${encodeURIComponent(item.title.replace(/ /g, "_"))}`,
     source: "wikipedia" as const,
   }));
 }
