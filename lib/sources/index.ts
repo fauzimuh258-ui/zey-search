@@ -2,58 +2,25 @@
 import { searchBing } from "./bing";
 import { searchYandex } from "./yandex";
 import { searchGitHub } from "./github";
-import { searchReddit } from "./reddit";
 import { searchWikipedia } from "./wikipedia";
 import { MultiSourceResult, SourceName } from "./types";
+import { filterAndRankByRelevance, ScoredResult } from "../relevance";
 
 const MAX_TOTAL_RESULTS = 7;
+const MAX_AI_OVERVIEW_SOURCES = 3;
 
-// --- Design note -------------------------------------------------------
-// The spec asks for two things that are in tension read literally:
-//   1. "Fetch dari 4 sumber PARALEL" — fetch all 4 sources in parallel.
-//   2. A linear fallback chain: Yandex down → Bing → Reddit → GitHub →
-//      Wikipedia (terakhir).
-// A parallel fetch of all 4 doesn't need a *sequential* retry chain for
-// individual failures — merging whatever succeeded already degrades
-// gracefully on its own. So here:
-//   - All 4 primary sources run in parallel via Promise.allSettled.
-//   - The chain's order (Yandex, Bing, Reddit, GitHub) is used as PRIORITY
-//     when interleaving results, not as a sequential retry.
-//   - Wikipedia sits outside the parallel batch and is only called if every
-//     single primary source fails or returns zero results — matching
-//     "Semua down → Wikipedia (terakhir)" literally.
-// -------------------------------------------------------------------------
+// CHANGE: Reddit dropped from the primary source list — the new spec only
+// lists Bing, Yandex, GitHub, and Wikipedia-as-fallback.
+// lib/sources/reddit.ts is untouched if it needs to come back later.
 const PRIMARY_SOURCES: { name: SourceName; fetcher: (q: string) => Promise<MultiSourceResult[]> }[] = [
-  { name: "yandex", fetcher: searchYandex },
   { name: "bing", fetcher: searchBing },
-  { name: "reddit", fetcher: searchReddit },
+  { name: "yandex", fetcher: searchYandex },
   { name: "github", fetcher: searchGitHub },
 ];
 
-// Round-robins across sources (1 from Yandex, 1 from Bing, 1 from Reddit, 1
-// from GitHub, back to Yandex, ...) instead of concatenating source-by-source,
-// so a source that returns more results doesn't crowd out the others in the
-// final top-7.
-function interleave(buckets: MultiSourceResult[][]): MultiSourceResult[] {
-  const merged: MultiSourceResult[] = [];
-  const maxLen = Math.max(0, ...buckets.map((b) => b.length));
-
-  for (let i = 0; i < maxLen; i++) {
-    for (const bucket of buckets) {
-      if (bucket[i]) merged.push(bucket[i]);
-    }
-  }
-
-  return merged;
-}
-
-// Addition: dedupe by URL — Bing and Yandex in particular often surface the
-// same top pages for a given query, and a literal duplicate wastes one of
-// the seven available slots.
 function dedupeByUrl(results: MultiSourceResult[]): MultiSourceResult[] {
   const seen = new Set<string>();
   const deduped: MultiSourceResult[] = [];
-
   for (const result of results) {
     const key = result.url.replace(/\/+$/, "").toLowerCase();
     if (!seen.has(key)) {
@@ -61,45 +28,65 @@ function dedupeByUrl(results: MultiSourceResult[]): MultiSourceResult[] {
       deduped.push(result);
     }
   }
-
   return deduped;
 }
 
-export async function multiSourceSearch(query: string): Promise<MultiSourceResult[]> {
+async function fetchPrimarySources(query: string): Promise<MultiSourceResult[]> {
   const settled = await Promise.allSettled(PRIMARY_SOURCES.map((s) => s.fetcher(query)));
 
-  const buckets: MultiSourceResult[][] = settled.map((result, i) => {
+  const merged: MultiSourceResult[] = [];
+  settled.forEach((result, i) => {
     if (result.status === "fulfilled") {
-      return result.value;
+      merged.push(...result.value);
+    } else {
+      // If this shows up consistently for bing/yandex in production, that's
+      // almost certainly why results were 100% Wikipedia — Bing/Yandex tend to
+      // block or rate-limit requests from datacenter IPs like Vercel's.
+      console.error(`[multiSourceSearch] ${PRIMARY_SOURCES[i].name} failed:`, result.reason);
     }
-    console.error(`[multiSourceSearch] ${PRIMARY_SOURCES[i].name} failed:`, result.reason);
-    return [];
   });
 
-  const merged = dedupeByUrl(interleave(buckets));
+  return dedupeByUrl(merged);
+}
 
-  if (merged.length > 0) {
-    return merged.slice(0, MAX_TOTAL_RESULTS);
+export interface MultiSourceSearchResult {
+  results: ScoredResult[]; // up to 7, all at/above RELEVANCE_THRESHOLD
+  overviewSources: ScoredResult[]; // top 3 of `results`, for the AI Overview
+  usedFallback: boolean; // true if Wikipedia had to cover for the primary sources
+}
+
+// CHANGE: the previous fallback trigger was "all primary sources returned
+// zero results". That's not sufficient — a source can return results that
+// are simply irrelevant (the reported bug: Wikipedia surfacing "QGIS" for
+// "neural network"). The trigger is now "nothing survives the relevance
+// filter", and Wikipedia's own output goes through that same filter before
+// it's trusted either — so the fallback can't reintroduce the exact problem
+// it exists to solve.
+export async function multiSourceSearch(query: string): Promise<MultiSourceSearchResult> {
+  const primaryRaw = await fetchPrimarySources(query);
+  const primaryRanked = filterAndRankByRelevance(query, primaryRaw);
+
+  if (primaryRanked.length > 0) {
+    return {
+      results: primaryRanked.slice(0, MAX_TOTAL_RESULTS),
+      overviewSources: primaryRanked.slice(0, MAX_AI_OVERVIEW_SOURCES),
+      usedFallback: false,
+    };
   }
 
-  // All 4 primary sources failed or returned nothing — last-resort fallback.
   try {
-    const wikipediaResults = await searchWikipedia(query);
-    return wikipediaResults.slice(0, MAX_TOTAL_RESULTS);
+    const wikipediaRaw = await searchWikipedia(query);
+    const wikipediaRanked = filterAndRankByRelevance(query, wikipediaRaw);
+    return {
+      results: wikipediaRanked.slice(0, MAX_TOTAL_RESULTS),
+      overviewSources: wikipediaRanked.slice(0, MAX_AI_OVERVIEW_SOURCES),
+      usedFallback: true,
+    };
   } catch (error) {
     console.error("[multiSourceSearch] Wikipedia fallback also failed:", error);
-    return [];
+    return { results: [], overviewSources: [], usedFallback: true };
   }
 }
 
 export type { MultiSourceResult, SourceName } from "./types";
-
-// --- Example usage in a route handler -----------------------------------
-// import { multiSourceSearch } from "@/lib/sources";
-//
-// export async function POST(req: NextRequest) {
-//   const { query } = await req.json();
-//   const results = await multiSourceSearch(query);
-//   return NextResponse.json({ results });
-// }
-// -------------------------------------------------------------------------
+export type { ScoredResult } from "../relevance";
